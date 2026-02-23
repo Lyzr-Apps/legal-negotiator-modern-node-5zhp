@@ -325,6 +325,268 @@ function getChangeTypeColor(ct: string): string {
   return CHANGE_TYPE_COLORS[ct?.toLowerCase()] ?? 'bg-gray-100 text-gray-700'
 }
 
+// ─── Response Extraction Helpers ─────────────────────────────────────────────
+
+/**
+ * Robustly extract AnalysisData from the agent response.
+ * The response can arrive in many forms:
+ * - Already a parsed object with the expected fields
+ * - A JSON string needing parsing
+ * - Nested under .result, .response, .data, .text etc.
+ * - Wrapped in markdown code blocks
+ */
+function extractAnalysisData(rawResult: any, fullResult?: any): AnalysisData | null {
+  // Try multiple extraction strategies
+  const candidates: any[] = []
+
+  // Strategy 1: rawResult is already the data object
+  if (rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)) {
+    candidates.push(rawResult)
+  }
+
+  // Strategy 2: Parse rawResult through parseLLMJson
+  if (rawResult) {
+    try {
+      const parsed = parseLLMJson(rawResult)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        // parseLLMJson returns { success: false, data: null, error: '...' } on failure
+        if (parsed.success === false && parsed.data === null && parsed.error) {
+          // Parsing failed - skip this candidate
+        } else {
+          candidates.push(parsed)
+        }
+      }
+    } catch {}
+  }
+
+  // Strategy 3: If rawResult is a string, try JSON.parse directly
+  if (typeof rawResult === 'string') {
+    try { candidates.push(JSON.parse(rawResult)) } catch {}
+  }
+
+  // Strategy 4: Check nested paths in rawResult
+  if (rawResult && typeof rawResult === 'object') {
+    for (const key of ['result', 'response', 'data', 'output', 'content']) {
+      const nested = rawResult[key]
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+        candidates.push(nested)
+      }
+      if (typeof nested === 'string') {
+        try { candidates.push(JSON.parse(nested)) } catch {}
+        try {
+          const p = parseLLMJson(nested)
+          if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
+            candidates.push(p)
+          }
+        } catch {}
+      }
+    }
+    // Check for text field that might contain JSON
+    if (typeof rawResult.text === 'string') {
+      try { candidates.push(JSON.parse(rawResult.text)) } catch {}
+      try {
+        const p = parseLLMJson(rawResult.text)
+        if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
+          candidates.push(p)
+        }
+      } catch {}
+    }
+    if (typeof rawResult.message === 'string') {
+      try { candidates.push(JSON.parse(rawResult.message)) } catch {}
+      try {
+        const p = parseLLMJson(rawResult.message)
+        if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
+          candidates.push(p)
+        }
+      } catch {}
+    }
+  }
+
+  // Strategy 5: Check fullResult.raw_response
+  if (fullResult?.raw_response) {
+    try {
+      const p = parseLLMJson(fullResult.raw_response)
+      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
+        candidates.push(p)
+        // Dig one more level
+        if (p.response?.result) candidates.push(p.response.result)
+        if (p.result) candidates.push(p.result)
+      }
+    } catch {}
+  }
+
+  // Strategy 6: Check fullResult.response.message
+  if (typeof fullResult?.response?.message === 'string' && fullResult.response.message.trim().startsWith('{')) {
+    try { candidates.push(JSON.parse(fullResult.response.message)) } catch {}
+    try {
+      const p = parseLLMJson(fullResult.response.message)
+      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
+        candidates.push(p)
+      }
+    } catch {}
+  }
+
+  // Now find the best candidate that has clause_analyses or executive_summary
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    // Direct match
+    if (candidate.clause_analyses || candidate.executive_summary) {
+      return normalizeAnalysisData(candidate)
+    }
+    // One level deep
+    for (const key of ['result', 'response', 'data', 'output']) {
+      const nested = candidate[key]
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+        if (nested.clause_analyses || nested.executive_summary) {
+          return normalizeAnalysisData(nested)
+        }
+      }
+      if (typeof nested === 'string') {
+        try {
+          const np = JSON.parse(nested)
+          if (np && (np.clause_analyses || np.executive_summary)) {
+            return normalizeAnalysisData(np)
+          }
+        } catch {}
+      }
+    }
+  }
+
+  console.error('[NDA] No candidate matched AnalysisData shape. Candidates:', candidates.map(c => Object.keys(c || {})))
+  return null
+}
+
+function normalizeAnalysisData(obj: any): AnalysisData {
+  return {
+    executive_summary: obj.executive_summary ?? obj.summary ?? '',
+    total_changes_analyzed: typeof obj.total_changes_analyzed === 'number' ? obj.total_changes_analyzed : (Array.isArray(obj.clause_analyses) ? obj.clause_analyses.length : 0),
+    risk_breakdown: {
+      critical: obj.risk_breakdown?.critical ?? obj.risk_breakdown?.Critical ?? 0,
+      high: obj.risk_breakdown?.high ?? obj.risk_breakdown?.High ?? 0,
+      medium: obj.risk_breakdown?.medium ?? obj.risk_breakdown?.Medium ?? 0,
+      low: obj.risk_breakdown?.low ?? obj.risk_breakdown?.Low ?? 0,
+      none: obj.risk_breakdown?.none ?? obj.risk_breakdown?.None ?? 0,
+    },
+    requires_senior_review: obj.requires_senior_review ?? false,
+    clause_analyses: Array.isArray(obj.clause_analyses) ? obj.clause_analyses.map((c: any, idx: number) => ({
+      change_id: c.change_id ?? `CHG-${String(idx + 1).padStart(3, '0')}`,
+      clause_reference: c.clause_reference ?? c.clause ?? c.section ?? '',
+      change_type: c.change_type ?? c.type ?? 'modification',
+      original_text: c.original_text ?? c.original ?? '',
+      proposed_text: c.proposed_text ?? c.proposed ?? c.new_text ?? '',
+      change_summary: c.change_summary ?? c.summary ?? c.description ?? '',
+      risk_level: c.risk_level ?? c.risk ?? 'Medium',
+      recommendation: c.recommendation ?? c.action ?? 'Escalate',
+      reasoning: c.reasoning ?? c.reason ?? c.analysis ?? '',
+      policy_reference: c.policy_reference ?? c.policy ?? '',
+      counter_proposal_text: c.counter_proposal_text ?? c.counter_proposal ?? '',
+      response_text: c.response_text ?? c.response ?? '',
+      suggested_redline: c.suggested_redline ?? c.redline ?? '',
+      is_protective_language_deletion: c.is_protective_language_deletion ?? false,
+      legal_keywords_detected: Array.isArray(c.legal_keywords_detected) ? c.legal_keywords_detected : (Array.isArray(c.keywords) ? c.keywords : []),
+    })) : [],
+    overall_email_draft: obj.overall_email_draft ?? obj.email_draft ?? '',
+    negotiation_summary: obj.negotiation_summary ?? obj.summary ?? '',
+  }
+}
+
+function extractOutputData(rawResult: any, fullResult?: any): OutputData | null {
+  const candidates: any[] = []
+
+  if (rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)) {
+    candidates.push(rawResult)
+  }
+  if (rawResult) {
+    try {
+      const parsed = parseLLMJson(rawResult)
+      if (parsed && typeof parsed === 'object' && !(parsed.success === false && parsed.data === null)) {
+        candidates.push(parsed)
+      }
+    } catch {}
+  }
+  if (typeof rawResult === 'string') {
+    try { candidates.push(JSON.parse(rawResult)) } catch {}
+  }
+  if (rawResult && typeof rawResult === 'object') {
+    for (const key of ['result', 'response', 'data', 'output', 'text', 'message']) {
+      const nested = rawResult[key]
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) candidates.push(nested)
+      if (typeof nested === 'string') {
+        try { candidates.push(JSON.parse(nested)) } catch {}
+        try {
+          const p = parseLLMJson(nested)
+          if (p && typeof p === 'object' && !(p.success === false && p.data === null)) candidates.push(p)
+        } catch {}
+      }
+    }
+  }
+  if (fullResult?.raw_response) {
+    try {
+      const p = parseLLMJson(fullResult.raw_response)
+      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
+        candidates.push(p)
+        if (p.response?.result) candidates.push(p.response.result)
+        if (p.result) candidates.push(p.result)
+      }
+    } catch {}
+  }
+  if (typeof fullResult?.response?.message === 'string' && fullResult.response.message.trim().startsWith('{')) {
+    try { candidates.push(JSON.parse(fullResult.response.message)) } catch {}
+    try {
+      const p = parseLLMJson(fullResult.response.message)
+      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) candidates.push(p)
+    } catch {}
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    if (candidate.final_email || candidate.redline_instructions || candidate.audit_trail) {
+      return normalizeOutputData(candidate)
+    }
+    for (const key of ['result', 'response', 'data', 'output']) {
+      const nested = candidate[key]
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+        if (nested.final_email || nested.redline_instructions || nested.audit_trail) {
+          return normalizeOutputData(nested)
+        }
+      }
+      if (typeof nested === 'string') {
+        try {
+          const np = JSON.parse(nested)
+          if (np && (np.final_email || np.redline_instructions || np.audit_trail)) {
+            return normalizeOutputData(np)
+          }
+        } catch {}
+      }
+    }
+  }
+
+  console.error('[NDA] No candidate matched OutputData shape. Candidates:', candidates.map(c => Object.keys(c || {})))
+  return null
+}
+
+function normalizeOutputData(obj: any): OutputData {
+  return {
+    final_email: obj.final_email ?? obj.email ?? '',
+    redline_instructions: Array.isArray(obj.redline_instructions) ? obj.redline_instructions.map((ri: any) => ({
+      change_id: ri.change_id ?? '',
+      clause_reference: ri.clause_reference ?? ri.clause ?? '',
+      action: ri.action ?? '',
+      original_text: ri.original_text ?? ri.original ?? '',
+      final_text: ri.final_text ?? ri.final ?? '',
+      instruction: ri.instruction ?? ri.instructions ?? '',
+    })) : [],
+    audit_trail: Array.isArray(obj.audit_trail) ? obj.audit_trail.map((at: any) => ({
+      change_id: at.change_id ?? '',
+      system_recommendation: at.system_recommendation ?? at.recommendation ?? '',
+      final_decision: at.final_decision ?? at.decision ?? '',
+      was_overridden: at.was_overridden ?? false,
+      override_notes: at.override_notes ?? at.notes ?? '',
+    })) : [],
+    decision_summary: obj.decision_summary ?? obj.summary ?? '',
+  }
+}
+
 // ─── ErrorBoundary ───────────────────────────────────────────────────────────
 
 class ErrorBoundary extends React.Component<
@@ -717,18 +979,23 @@ export default function Page() {
       )
 
       if (result.success && result.response?.status === 'success') {
-        const parsed = parseLLMJson(result.response.result)
-        if (parsed && !parsed.error) {
-          setAnalysisData(parsed as AnalysisData)
+        const rawResult = result.response?.result
+        const data = extractAnalysisData(rawResult, result)
+        if (data) {
+          setAnalysisData(data)
           setProgress(100)
           setScreen('review')
         } else {
-          setAnalysisError('Failed to parse the analysis response. Please try again.')
+          console.error('[NDA] Could not extract analysis data from response:', JSON.stringify(result).slice(0, 2000))
+          setAnalysisError('The agent returned a response but it could not be mapped to the expected format. Check the console for details.')
         }
       } else {
-        setAnalysisError(result.error ?? result.response?.message ?? 'Analysis failed. Please try again.')
+        const errMsg = result.error ?? result.response?.message ?? 'Analysis failed.'
+        console.error('[NDA] Agent call not successful:', errMsg, JSON.stringify(result).slice(0, 1000))
+        setAnalysisError(errMsg)
       }
     } catch (err: any) {
+      console.error('[NDA] Analysis exception:', err)
       setAnalysisError(err?.message ?? 'An unexpected error occurred.')
     } finally {
       setAnalyzing(false)
@@ -775,15 +1042,19 @@ export default function Page() {
       const result = await callAIAgent(message, DOCUMENT_OUTPUT_AGENT_ID)
 
       if (result.success && result.response?.status === 'success') {
-        const parsed = parseLLMJson(result.response.result)
-        if (parsed && !parsed.error) {
-          setOutputData(parsed as OutputData)
+        const rawResult = result.response?.result
+        const data = extractOutputData(rawResult, result)
+        if (data) {
+          setOutputData(data)
           setScreen('output')
         } else {
-          setGenerateError('Failed to parse the output response. Please try again.')
+          console.error('[NDA] Could not extract output data from response:', JSON.stringify(result).slice(0, 2000))
+          setGenerateError('The agent returned a response but it could not be mapped to the expected format. Check the console for details.')
         }
       } else {
-        setGenerateError(result.error ?? result.response?.message ?? 'Output generation failed. Please try again.')
+        const errMsg = result.error ?? result.response?.message ?? 'Output generation failed.'
+        console.error('[NDA] Output agent call not successful:', errMsg)
+        setGenerateError(errMsg)
       }
     } catch (err: any) {
       setGenerateError(err?.message ?? 'An unexpected error occurred.')
