@@ -328,131 +328,158 @@ function getChangeTypeColor(ct: string): string {
 // ─── Response Extraction Helpers ─────────────────────────────────────────────
 
 /**
- * Robustly extract AnalysisData from the agent response.
- * The response can arrive in many forms:
- * - Already a parsed object with the expected fields
- * - A JSON string needing parsing
- * - Nested under .result, .response, .data, .text etc.
- * - Wrapped in markdown code blocks
+ * Safely attempt to parse a value as JSON through multiple strategies.
+ * Returns parsed object or null.
+ */
+function tryParseJson(val: any): any | null {
+  if (!val) return null
+  // Already an object
+  if (typeof val === 'object' && !Array.isArray(val)) return val
+  if (typeof val !== 'string') return null
+
+  const trimmed = val.trim()
+
+  // Direct JSON parse
+  try { return JSON.parse(trimmed) } catch {}
+
+  // Strip markdown code blocks
+  const codeBlockMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (codeBlockMatch?.[1]) {
+    try { return JSON.parse(codeBlockMatch[1].trim()) } catch {}
+  }
+
+  // Find first { ... } or [ ... ] in the string
+  const firstBrace = trimmed.indexOf('{')
+  const lastBrace = trimmed.lastIndexOf('}')
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try { return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1)) } catch {}
+  }
+
+  // Use parseLLMJson as last resort
+  try {
+    const p = parseLLMJson(val)
+    if (p && typeof p === 'object' && !(p.success === false && p.data === null && p.error)) {
+      return p
+    }
+  } catch {}
+
+  return null
+}
+
+/**
+ * Recursively collect all objects from a nested structure up to a depth limit.
+ * This finds the target data no matter how deeply it is nested.
+ */
+function collectAllObjects(val: any, depth: number = 0, maxDepth: number = 5): any[] {
+  if (depth > maxDepth || !val) return []
+  const results: any[] = []
+
+  if (typeof val === 'string') {
+    const parsed = tryParseJson(val)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      results.push(parsed)
+      results.push(...collectAllObjects(parsed, depth + 1, maxDepth))
+    }
+    return results
+  }
+
+  if (Array.isArray(val)) return results
+
+  if (typeof val === 'object') {
+    results.push(val)
+    for (const key of Object.keys(val)) {
+      const child = val[key]
+      if (typeof child === 'string') {
+        const parsed = tryParseJson(child)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          results.push(parsed)
+          results.push(...collectAllObjects(parsed, depth + 1, maxDepth))
+        }
+      } else if (typeof child === 'object' && child !== null && !Array.isArray(child)) {
+        results.push(...collectAllObjects(child, depth + 1, maxDepth))
+      }
+    }
+  }
+
+  return results
+}
+
+/**
+ * Check if an object looks like AnalysisData (has key marker fields).
+ */
+function looksLikeAnalysis(obj: any): boolean {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false
+  return !!(obj.clause_analyses || obj.executive_summary || obj.risk_breakdown ||
+            obj.total_changes_analyzed || obj.negotiation_summary || obj.overall_email_draft)
+}
+
+/**
+ * Check if an object looks like OutputData (has key marker fields).
+ */
+function looksLikeOutput(obj: any): boolean {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false
+  return !!(obj.final_email || obj.redline_instructions || obj.audit_trail || obj.decision_summary)
+}
+
+/**
+ * Extract AnalysisData from the agent response by searching the entire response tree.
  */
 function extractAnalysisData(rawResult: any, fullResult?: any): AnalysisData | null {
-  // Try multiple extraction strategies
-  const candidates: any[] = []
+  // Collect all candidate objects from rawResult
+  const candidates = collectAllObjects(rawResult)
 
-  // Strategy 1: rawResult is already the data object
-  if (rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)) {
-    candidates.push(rawResult)
-  }
-
-  // Strategy 2: Parse rawResult through parseLLMJson
-  if (rawResult) {
-    try {
-      const parsed = parseLLMJson(rawResult)
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        // parseLLMJson returns { success: false, data: null, error: '...' } on failure
-        if (parsed.success === false && parsed.data === null && parsed.error) {
-          // Parsing failed - skip this candidate
-        } else {
-          candidates.push(parsed)
-        }
-      }
-    } catch {}
-  }
-
-  // Strategy 3: If rawResult is a string, try JSON.parse directly
-  if (typeof rawResult === 'string') {
-    try { candidates.push(JSON.parse(rawResult)) } catch {}
-  }
-
-  // Strategy 4: Check nested paths in rawResult
-  if (rawResult && typeof rawResult === 'object') {
-    for (const key of ['result', 'response', 'data', 'output', 'content']) {
-      const nested = rawResult[key]
-      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
-        candidates.push(nested)
-      }
-      if (typeof nested === 'string') {
-        try { candidates.push(JSON.parse(nested)) } catch {}
-        try {
-          const p = parseLLMJson(nested)
-          if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
-            candidates.push(p)
-          }
-        } catch {}
-      }
+  // Also search fullResult fields
+  if (fullResult) {
+    if (fullResult.raw_response) {
+      candidates.push(...collectAllObjects(fullResult.raw_response))
     }
-    // Check for text field that might contain JSON
-    if (typeof rawResult.text === 'string') {
-      try { candidates.push(JSON.parse(rawResult.text)) } catch {}
-      try {
-        const p = parseLLMJson(rawResult.text)
-        if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
-          candidates.push(p)
-        }
-      } catch {}
+    if (fullResult.response) {
+      candidates.push(...collectAllObjects(fullResult.response))
     }
-    if (typeof rawResult.message === 'string') {
-      try { candidates.push(JSON.parse(rawResult.message)) } catch {}
-      try {
-        const p = parseLLMJson(rawResult.message)
-        if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
-          candidates.push(p)
-        }
-      } catch {}
+    if (fullResult.module_outputs) {
+      candidates.push(...collectAllObjects(fullResult.module_outputs))
     }
+    // Top-level fullResult itself
+    candidates.push(...collectAllObjects(fullResult, 0, 3))
   }
 
-  // Strategy 5: Check fullResult.raw_response
-  if (fullResult?.raw_response) {
-    try {
-      const p = parseLLMJson(fullResult.raw_response)
-      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
-        candidates.push(p)
-        // Dig one more level
-        if (p.response?.result) candidates.push(p.response.result)
-        if (p.result) candidates.push(p.result)
-      }
-    } catch {}
-  }
+  // Search candidates for the best match
+  // Priority: has clause_analyses array > has executive_summary > has risk_breakdown
+  let bestMatch: any = null
+  let bestScore = 0
 
-  // Strategy 6: Check fullResult.response.message
-  if (typeof fullResult?.response?.message === 'string' && fullResult.response.message.trim().startsWith('{')) {
-    try { candidates.push(JSON.parse(fullResult.response.message)) } catch {}
-    try {
-      const p = parseLLMJson(fullResult.response.message)
-      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
-        candidates.push(p)
-      }
-    } catch {}
-  }
-
-  // Now find the best candidate that has clause_analyses or executive_summary
   for (const candidate of candidates) {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
-    // Direct match
-    if (candidate.clause_analyses || candidate.executive_summary) {
-      return normalizeAnalysisData(candidate)
-    }
-    // One level deep
-    for (const key of ['result', 'response', 'data', 'output']) {
-      const nested = candidate[key]
-      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
-        if (nested.clause_analyses || nested.executive_summary) {
-          return normalizeAnalysisData(nested)
-        }
-      }
-      if (typeof nested === 'string') {
-        try {
-          const np = JSON.parse(nested)
-          if (np && (np.clause_analyses || np.executive_summary)) {
-            return normalizeAnalysisData(np)
-          }
-        } catch {}
-      }
+    if (!looksLikeAnalysis(candidate)) continue
+
+    let score = 0
+    if (Array.isArray(candidate.clause_analyses) && candidate.clause_analyses.length > 0) score += 10
+    if (candidate.clause_analyses) score += 5
+    if (candidate.executive_summary) score += 3
+    if (candidate.risk_breakdown) score += 2
+    if (candidate.total_changes_analyzed) score += 1
+    if (candidate.negotiation_summary) score += 1
+    if (candidate.overall_email_draft) score += 1
+
+    if (score > bestScore) {
+      bestScore = score
+      bestMatch = candidate
     }
   }
 
-  console.error('[NDA] No candidate matched AnalysisData shape. Candidates:', candidates.map(c => Object.keys(c || {})))
+  if (bestMatch) {
+    return normalizeAnalysisData(bestMatch)
+  }
+
+  // Last resort: log the full response shape for debugging
+  const shapes = candidates.slice(0, 10).map(c => {
+    if (!c || typeof c !== 'object') return String(c)?.slice(0, 50)
+    const keys = Object.keys(c)
+    return `{${keys.slice(0, 8).join(', ')}${keys.length > 8 ? '...' : ''}}`
+  })
+  console.error('[NDA] extractAnalysisData FAILED. Candidate shapes:', shapes)
+  console.error('[NDA] rawResult type:', typeof rawResult, '| keys:', rawResult && typeof rawResult === 'object' ? Object.keys(rawResult) : 'N/A')
+  console.error('[NDA] rawResult preview:', JSON.stringify(rawResult)?.slice(0, 500))
   return null
 }
 
@@ -490,78 +517,48 @@ function normalizeAnalysisData(obj: any): AnalysisData {
   }
 }
 
+/**
+ * Extract OutputData from the agent response by searching the entire response tree.
+ */
 function extractOutputData(rawResult: any, fullResult?: any): OutputData | null {
-  const candidates: any[] = []
+  const candidates = collectAllObjects(rawResult)
 
-  if (rawResult && typeof rawResult === 'object' && !Array.isArray(rawResult)) {
-    candidates.push(rawResult)
+  if (fullResult) {
+    if (fullResult.raw_response) candidates.push(...collectAllObjects(fullResult.raw_response))
+    if (fullResult.response) candidates.push(...collectAllObjects(fullResult.response))
+    candidates.push(...collectAllObjects(fullResult, 0, 3))
   }
-  if (rawResult) {
-    try {
-      const parsed = parseLLMJson(rawResult)
-      if (parsed && typeof parsed === 'object' && !(parsed.success === false && parsed.data === null)) {
-        candidates.push(parsed)
-      }
-    } catch {}
-  }
-  if (typeof rawResult === 'string') {
-    try { candidates.push(JSON.parse(rawResult)) } catch {}
-  }
-  if (rawResult && typeof rawResult === 'object') {
-    for (const key of ['result', 'response', 'data', 'output', 'text', 'message']) {
-      const nested = rawResult[key]
-      if (nested && typeof nested === 'object' && !Array.isArray(nested)) candidates.push(nested)
-      if (typeof nested === 'string') {
-        try { candidates.push(JSON.parse(nested)) } catch {}
-        try {
-          const p = parseLLMJson(nested)
-          if (p && typeof p === 'object' && !(p.success === false && p.data === null)) candidates.push(p)
-        } catch {}
-      }
-    }
-  }
-  if (fullResult?.raw_response) {
-    try {
-      const p = parseLLMJson(fullResult.raw_response)
-      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) {
-        candidates.push(p)
-        if (p.response?.result) candidates.push(p.response.result)
-        if (p.result) candidates.push(p.result)
-      }
-    } catch {}
-  }
-  if (typeof fullResult?.response?.message === 'string' && fullResult.response.message.trim().startsWith('{')) {
-    try { candidates.push(JSON.parse(fullResult.response.message)) } catch {}
-    try {
-      const p = parseLLMJson(fullResult.response.message)
-      if (p && typeof p === 'object' && !(p.success === false && p.data === null)) candidates.push(p)
-    } catch {}
-  }
+
+  let bestMatch: any = null
+  let bestScore = 0
 
   for (const candidate of candidates) {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
-    if (candidate.final_email || candidate.redline_instructions || candidate.audit_trail) {
-      return normalizeOutputData(candidate)
-    }
-    for (const key of ['result', 'response', 'data', 'output']) {
-      const nested = candidate[key]
-      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
-        if (nested.final_email || nested.redline_instructions || nested.audit_trail) {
-          return normalizeOutputData(nested)
-        }
-      }
-      if (typeof nested === 'string') {
-        try {
-          const np = JSON.parse(nested)
-          if (np && (np.final_email || np.redline_instructions || np.audit_trail)) {
-            return normalizeOutputData(np)
-          }
-        } catch {}
-      }
+    if (!looksLikeOutput(candidate)) continue
+
+    let score = 0
+    if (candidate.final_email) score += 5
+    if (Array.isArray(candidate.redline_instructions)) score += 4
+    if (Array.isArray(candidate.audit_trail)) score += 3
+    if (candidate.decision_summary) score += 2
+
+    if (score > bestScore) {
+      bestScore = score
+      bestMatch = candidate
     }
   }
 
-  console.error('[NDA] No candidate matched OutputData shape. Candidates:', candidates.map(c => Object.keys(c || {})))
+  if (bestMatch) {
+    return normalizeOutputData(bestMatch)
+  }
+
+  const shapes = candidates.slice(0, 10).map(c => {
+    if (!c || typeof c !== 'object') return String(c)?.slice(0, 50)
+    const keys = Object.keys(c)
+    return `{${keys.slice(0, 8).join(', ')}${keys.length > 8 ? '...' : ''}}`
+  })
+  console.error('[NDA] extractOutputData FAILED. Candidate shapes:', shapes)
+  console.error('[NDA] rawResult preview:', JSON.stringify(rawResult)?.slice(0, 500))
   return null
 }
 
@@ -1303,7 +1300,7 @@ export default function Page() {
         allAssetIds.length > 0 ? { assets: allAssetIds } : undefined
       )
 
-      if (result.success && result.response?.status === 'success') {
+      if (result.success) {
         const rawResult = result.response?.result
         const data = extractAnalysisData(rawResult, result)
         if (data) {
@@ -1311,12 +1308,17 @@ export default function Page() {
           setProgress(100)
           setScreen('review')
         } else {
-          console.error('[NDA] Could not extract analysis data from response:', JSON.stringify(result).slice(0, 2000))
-          setAnalysisError('The agent returned a response but it could not be mapped to the expected format. Check the console for details.')
+          // Show a diagnostic message with the actual response shape
+          const resultKeys = rawResult && typeof rawResult === 'object' ? Object.keys(rawResult) : []
+          const resultType = typeof rawResult
+          const preview = typeof rawResult === 'string' ? rawResult.slice(0, 200) : JSON.stringify(rawResult)?.slice(0, 200)
+          console.error('[NDA] Could not extract analysis data. rawResult type:', resultType, 'keys:', resultKeys, 'preview:', preview)
+          console.error('[NDA] Full result:', JSON.stringify(result).slice(0, 3000))
+          setAnalysisError(`Could not map agent response to expected format. Response type: ${resultType}, keys: [${resultKeys.join(', ')}]. Preview: ${preview}...`)
         }
       } else {
         const errMsg = result.error ?? result.response?.message ?? 'Analysis failed.'
-        console.error('[NDA] Agent call not successful:', errMsg, JSON.stringify(result).slice(0, 1000))
+        console.error('[NDA] Agent call not successful:', errMsg)
         setAnalysisError(errMsg)
       }
     } catch (err: any) {
@@ -1366,15 +1368,17 @@ export default function Page() {
 
       const result = await callAIAgent(message, DOCUMENT_OUTPUT_AGENT_ID)
 
-      if (result.success && result.response?.status === 'success') {
+      if (result.success) {
         const rawResult = result.response?.result
         const data = extractOutputData(rawResult, result)
         if (data) {
           setOutputData(data)
           setScreen('output')
         } else {
-          console.error('[NDA] Could not extract output data from response:', JSON.stringify(result).slice(0, 2000))
-          setGenerateError('The agent returned a response but it could not be mapped to the expected format. Check the console for details.')
+          const resultKeys = rawResult && typeof rawResult === 'object' ? Object.keys(rawResult) : []
+          const preview = typeof rawResult === 'string' ? rawResult.slice(0, 200) : JSON.stringify(rawResult)?.slice(0, 200)
+          console.error('[NDA] Could not extract output data. Preview:', preview)
+          setGenerateError(`Could not map output response. Keys: [${resultKeys.join(', ')}]. Preview: ${preview}...`)
         }
       } else {
         const errMsg = result.error ?? result.response?.message ?? 'Output generation failed.'
