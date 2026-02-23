@@ -1,0 +1,54 @@
+{
+  "agent_name": "Document Output Agent",
+  "agent_id": "699bfc2c69f2efc6b10175b1",
+  "description": "After user reviews and approves/overrides all recommendations, generates the final redlined Word document with FSL's counter-positions and a formatted email response ready for sending to the counterparty",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "response_schema": {
+    "final_email": "string",
+    "redline_instructions": [
+      {
+        "change_id": "string",
+        "clause_reference": "string",
+        "action": "string",
+        "original_text": "string",
+        "final_text": "string",
+        "instruction": "string"
+      }
+    ],
+    "audit_trail": [
+      {
+        "change_id": "string",
+        "system_recommendation": "string",
+        "final_decision": "string",
+        "was_overridden": "boolean",
+        "override_notes": "string"
+      }
+    ],
+    "decision_summary": "string"
+  },
+  "example_response": {
+    "final_email": "sample string",
+    "redline_instructions": [
+      {
+        "change_id": "sample string",
+        "clause_reference": "sample string",
+        "action": "sample string",
+        "original_text": "sample string",
+        "final_text": "sample string",
+        "instruction": "sample string"
+      }
+    ],
+    "audit_trail": [
+      {
+        "change_id": "sample string",
+        "system_recommendation": "sample string",
+        "final_decision": "sample string",
+        "was_overridden": false,
+        "override_notes": "sample string"
+      }
+    ],
+    "decision_summary": "sample string"
+  }
+}

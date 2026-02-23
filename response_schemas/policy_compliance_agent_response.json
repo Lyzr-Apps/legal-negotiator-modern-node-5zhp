@@ -1,0 +1,45 @@
+{
+  "agent_name": "Policy Compliance Agent",
+  "agent_id": "699bfc08ab50d38abec37be1",
+  "description": "Evaluates each extracted change against FSL's NDA policy guardrails and legal keyword detection rules — assigns risk levels (Critical/High/Medium/Low/None), recommendations (Accept/Reject/Counter-Propose/Escalate), and provides detailed reasoning referencing specific policy requirements",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "has_knowledge_base": true,
+  "rag_id": "699bfbc6e9e49857cb77c1bd",
+  "rag_name": "fslndapolicy9fo1",
+  "response_schema": {
+    "assessments": [
+      {
+        "change_id": "string",
+        "risk_level": "string",
+        "recommendation": "string",
+        "reasoning": "string",
+        "policy_reference": "string",
+        "counter_proposal_text": "string",
+        "escalation_reason": "string",
+        "legal_keywords_detected": ["string"]
+      }
+    ],
+    "overall_risk_summary": "string",
+    "critical_findings_count": "number",
+    "requires_senior_review": "boolean"
+  },
+  "example_response": {
+    "assessments": [
+      {
+        "change_id": "sample string",
+        "risk_level": "sample string",
+        "recommendation": "sample string",
+        "reasoning": "sample string",
+        "policy_reference": "sample string",
+        "counter_proposal_text": "sample string",
+        "escalation_reason": "sample string",
+        "legal_keywords_detected": ["sample string"]
+      }
+    ],
+    "overall_risk_summary": "sample string",
+    "critical_findings_count": 0,
+    "requires_senior_review": false
+  }
+}

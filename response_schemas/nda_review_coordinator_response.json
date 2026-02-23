@@ -1,0 +1,80 @@
+{
+  "agent_name": "NDA Review Coordinator",
+  "agent_id": "699bfc2cfb62c45cbd3beb2d",
+  "description": "Coordinates the end-to-end NDA analysis workflow — routes uploaded document/text to sub-agents, aggregates extraction results with compliance assessments and response text, and presents unified clause-by-clause analysis to the user",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "is_manager": true,
+  "managed_agents": [
+    "699bfbf34781b21fa64586d4",
+    "699bfc08ab50d38abec37be1",
+    "699bfbf4ab50d38abec37bd7"
+  ],
+  "response_schema": {
+    "executive_summary": "string",
+    "total_changes_analyzed": "number",
+    "risk_breakdown": {
+      "critical": "number",
+      "high": "number",
+      "medium": "number",
+      "low": "number",
+      "none": "number"
+    },
+    "requires_senior_review": "boolean",
+    "clause_analyses": [
+      {
+        "change_id": "string",
+        "clause_reference": "string",
+        "change_type": "string",
+        "original_text": "string",
+        "proposed_text": "string",
+        "change_summary": "string",
+        "risk_level": "string",
+        "recommendation": "string",
+        "reasoning": "string",
+        "policy_reference": "string",
+        "counter_proposal_text": "string",
+        "response_text": "string",
+        "suggested_redline": "string",
+        "is_protective_language_deletion": "boolean",
+        "legal_keywords_detected": ["string"]
+      }
+    ],
+    "overall_email_draft": "string",
+    "negotiation_summary": "string"
+  },
+  "example_response": {
+    "executive_summary": "sample string",
+    "total_changes_analyzed": 0,
+    "risk_breakdown": {
+      "critical": 0,
+      "high": 0,
+      "medium": 0,
+      "low": 0,
+      "none": 0
+    },
+    "requires_senior_review": false,
+    "clause_analyses": [
+      {
+        "change_id": "sample string",
+        "clause_reference": "sample string",
+        "change_type": "sample string",
+        "original_text": "sample string",
+        "proposed_text": "sample string",
+        "change_summary": "sample string",
+        "risk_level": "sample string",
+        "recommendation": "sample string",
+        "reasoning": "sample string",
+        "policy_reference": "sample string",
+        "counter_proposal_text": "sample string",
+        "response_text": "sample string",
+        "suggested_redline": "sample string",
+        "is_protective_language_deletion": false,
+        "legal_keywords_detected": ["sample string"]
+      }
+    ],
+    "overall_email_draft": "sample string",
+    "negotiation_summary": "sample string"
+  }
+}

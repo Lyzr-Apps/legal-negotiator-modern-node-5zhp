@@ -1,0 +1,34 @@
+{
+  "agent_name": "Response Generation Agent",
+  "agent_id": "699bfbf4ab50d38abec37bd7",
+  "description": "Generates professional negotiation response text for each change aligned to its assigned action type — using rejection language for rejects, counter-proposal language for negotiations, escalation language for flagged items, and validates response-action consistency",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "response_schema": {
+    "responses": [
+      {
+        "change_id": "string",
+        "response_type": "string",
+        "response_text": "string",
+        "suggested_redline": "string",
+        "email_summary": "string"
+      }
+    ],
+    "overall_email_draft": "string",
+    "negotiation_summary": "string"
+  },
+  "example_response": {
+    "responses": [
+      {
+        "change_id": "sample string",
+        "response_type": "sample string",
+        "response_text": "sample string",
+        "suggested_redline": "sample string",
+        "email_summary": "sample string"
+      }
+    ],
+    "overall_email_draft": "sample string",
+    "negotiation_summary": "sample string"
+  }
+}

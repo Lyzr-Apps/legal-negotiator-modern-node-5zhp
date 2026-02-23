@@ -1,0 +1,40 @@
+{
+  "agent_name": "Change Extraction Agent",
+  "agent_id": "699bfbf34781b21fa64586d4",
+  "description": "Parses redlined .docx tracked changes or unstructured email text to extract all change requests with before/after text, clause references, change types (addition/deletion/modification), and detects multi-issue changes requiring split analysis",
+  "agent_type": "json",
+  "accessor": "result",
+  "auto_generated": true,
+  "response_schema": {
+    "total_changes": "number",
+    "parsing_notes": "string",
+    "changes": [
+      {
+        "change_id": "string",
+        "clause_reference": "string",
+        "change_type": "string",
+        "original_text": "string",
+        "proposed_text": "string",
+        "change_summary": "string",
+        "is_protective_language_deletion": "boolean",
+        "requires_split": "boolean"
+      }
+    ]
+  },
+  "example_response": {
+    "total_changes": 0,
+    "parsing_notes": "sample string",
+    "changes": [
+      {
+        "change_id": "sample string",
+        "clause_reference": "sample string",
+        "change_type": "sample string",
+        "original_text": "sample string",
+        "proposed_text": "sample string",
+        "change_summary": "sample string",
+        "is_protective_language_deletion": false,
+        "requires_split": false
+      }
+    ]
+  }
+}
