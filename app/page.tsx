@@ -644,22 +644,347 @@ function RiskPill({ label, count, color }: { label: string; count: number; color
   )
 }
 
-function DiffView({ original, proposed }: { original: string; proposed: string }) {
+// ─── Word-Level Diff Engine ──────────────────────────────────────────────────
+
+interface DiffSegment {
+  type: 'equal' | 'delete' | 'insert'
+  text: string
+}
+
+function tokenize(text: string): string[] {
+  // Split into words while preserving whitespace and punctuation as separate tokens
+  const tokens: string[] = []
+  const regex = /(\s+|[^\s]+)/g
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(text)) !== null) {
+    tokens.push(match[0])
+  }
+  return tokens
+}
+
+function computeWordDiff(original: string, proposed: string): DiffSegment[] {
+  if (!original && !proposed) return []
+  if (!original) return [{ type: 'insert', text: proposed }]
+  if (!proposed) return [{ type: 'delete', text: original }]
+  if (original === proposed) return [{ type: 'equal', text: original }]
+
+  const oldTokens = tokenize(original)
+  const newTokens = tokenize(proposed)
+
+  // LCS-based diff using Myers-like approach with O(NM) DP for correctness
+  const n = oldTokens.length
+  const m = newTokens.length
+
+  // For very long texts, fall back to sentence-level diff
+  if (n * m > 500000) {
+    return computeSentenceDiff(original, proposed)
+  }
+
+  // Build LCS table
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0))
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      if (oldTokens[i - 1] === newTokens[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1] + 1
+      } else {
+        dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1])
+      }
+    }
+  }
+
+  // Backtrack to produce diff
+  const segments: DiffSegment[] = []
+  let i = n, j = m
+
+  const rawOps: Array<{ type: 'equal' | 'delete' | 'insert'; token: string }> = []
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldTokens[i - 1] === newTokens[j - 1]) {
+      rawOps.unshift({ type: 'equal', token: oldTokens[i - 1] })
+      i--; j--
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      rawOps.unshift({ type: 'insert', token: newTokens[j - 1] })
+      j--
+    } else {
+      rawOps.unshift({ type: 'delete', token: oldTokens[i - 1] })
+      i--
+    }
+  }
+
+  // Merge consecutive operations of the same type
+  for (const op of rawOps) {
+    if (segments.length > 0 && segments[segments.length - 1].type === op.type) {
+      segments[segments.length - 1].text += op.token
+    } else {
+      segments.push({ type: op.type, text: op.token })
+    }
+  }
+
+  return segments
+}
+
+function computeSentenceDiff(original: string, proposed: string): DiffSegment[] {
+  // Sentence-level fallback for very long texts
+  const splitSentences = (t: string) => t.split(/(?<=[.!?;])\s+/).filter(Boolean)
+  const oldSents = splitSentences(original)
+  const newSents = splitSentences(proposed)
+
+  const oldSet = new Set(oldSents)
+  const newSet = new Set(newSents)
+
+  const segments: DiffSegment[] = []
+
+  // Interleave: show removed sentences, then added ones, with matching ones in between
+  const allOld = new Set<number>()
+  const allNew = new Set<number>()
+
+  // Find matches
+  let oi = 0, ni = 0
+  while (oi < oldSents.length || ni < newSents.length) {
+    if (oi < oldSents.length && ni < newSents.length && oldSents[oi] === newSents[ni]) {
+      segments.push({ type: 'equal', text: oldSents[oi] + ' ' })
+      oi++; ni++
+    } else if (oi < oldSents.length && !newSet.has(oldSents[oi])) {
+      segments.push({ type: 'delete', text: oldSents[oi] + ' ' })
+      oi++
+    } else if (ni < newSents.length && !oldSet.has(newSents[ni])) {
+      segments.push({ type: 'insert', text: newSents[ni] + ' ' })
+      ni++
+    } else {
+      // Mismatch - consume both
+      if (oi < oldSents.length) {
+        segments.push({ type: 'delete', text: oldSents[oi] + ' ' })
+        oi++
+      }
+      if (ni < newSents.length) {
+        segments.push({ type: 'insert', text: newSents[ni] + ' ' })
+        ni++
+      }
+    }
+  }
+
+  return segments
+}
+
+// ─── Redline Components ─────────────────────────────────────────────────────
+
+function RedlineMarkup({ segments }: { segments: DiffSegment[] }) {
+  if (segments.length === 0) return <span className="text-slate-400 italic text-sm">(no content)</span>
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-      <div className="rounded-md border border-red-200 bg-red-50/50 p-3">
-        <div className="flex items-center gap-1.5 mb-2">
-          <FiXCircle className="h-3.5 w-3.5 text-red-500" />
-          <span className="text-xs font-semibold text-red-700 uppercase tracking-wide">Original</span>
+    <span className="text-sm leading-relaxed">
+      {segments.map((seg, i) => {
+        if (seg.type === 'equal') {
+          return <span key={i}>{seg.text}</span>
+        }
+        if (seg.type === 'delete') {
+          return (
+            <span key={i} className="bg-red-100 text-red-800 line-through decoration-red-500 decoration-2 px-0.5 rounded-sm" title="Deleted from original">
+              {seg.text}
+            </span>
+          )
+        }
+        // insert
+        return (
+          <span key={i} className="bg-green-100 text-green-800 underline decoration-green-500 decoration-2 underline-offset-2 px-0.5 rounded-sm" title="Added by counterparty">
+            {seg.text}
+          </span>
+        )
+      })}
+    </span>
+  )
+}
+
+function DiffView({ original, proposed, changeType }: { original: string; proposed: string; changeType?: string }) {
+  const [viewMode, setViewMode] = useState<'redline' | 'sidebyside'>('redline')
+
+  const segments = useMemo(() => computeWordDiff(original || '', proposed || ''), [original, proposed])
+
+  const stats = useMemo(() => {
+    let deletions = 0, insertions = 0
+    for (const seg of segments) {
+      if (seg.type === 'delete') deletions++
+      if (seg.type === 'insert') insertions++
+    }
+    return { deletions, insertions }
+  }, [segments])
+
+  const ct = changeType?.toLowerCase()
+
+  return (
+    <div className="space-y-2">
+      {/* Header with view toggle and stats */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <h4 className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Document Comparison</h4>
+          <div className="flex items-center gap-1 text-xs text-slate-400">
+            {stats.deletions > 0 && (
+              <span className="flex items-center gap-0.5 text-red-600">
+                <span className="inline-block w-2 h-2 rounded-full bg-red-500" />
+                {stats.deletions} removed
+              </span>
+            )}
+            {stats.insertions > 0 && (
+              <span className="flex items-center gap-0.5 text-green-600 ml-2">
+                <span className="inline-block w-2 h-2 rounded-full bg-green-500" />
+                {stats.insertions} added
+              </span>
+            )}
+          </div>
         </div>
-        <p className="text-sm text-red-900 leading-relaxed">{original || '(empty)'}</p>
+        <div className="flex items-center bg-slate-100 rounded-md p-0.5">
+          <button
+            onClick={() => setViewMode('redline')}
+            className={cn('px-2 py-1 text-xs rounded transition-colors', viewMode === 'redline' ? 'bg-white text-slate-800 shadow-sm font-medium' : 'text-slate-500 hover:text-slate-700')}
+          >
+            Redline
+          </button>
+          <button
+            onClick={() => setViewMode('sidebyside')}
+            className={cn('px-2 py-1 text-xs rounded transition-colors', viewMode === 'sidebyside' ? 'bg-white text-slate-800 shadow-sm font-medium' : 'text-slate-500 hover:text-slate-700')}
+          >
+            Side-by-Side
+          </button>
+        </div>
       </div>
-      <div className="rounded-md border border-green-200 bg-green-50/50 p-3">
-        <div className="flex items-center gap-1.5 mb-2">
-          <FiCheckCircle className="h-3.5 w-3.5 text-green-500" />
-          <span className="text-xs font-semibold text-green-700 uppercase tracking-wide">Proposed</span>
+
+      {viewMode === 'redline' ? (
+        /* ── Redline (Tracked Changes) View ── */
+        <div className="rounded-md border border-slate-200 bg-white p-4">
+          {ct === 'deletion' && !proposed ? (
+            <div>
+              <div className="flex items-center gap-1.5 mb-2">
+                <FiAlertTriangle className="h-3.5 w-3.5 text-red-500" />
+                <span className="text-xs font-semibold text-red-600 uppercase">Entire Clause Deleted</span>
+              </div>
+              <span className="text-sm bg-red-100 text-red-800 line-through decoration-red-500 decoration-2 leading-relaxed">{original}</span>
+            </div>
+          ) : ct === 'addition' && !original ? (
+            <div>
+              <div className="flex items-center gap-1.5 mb-2">
+                <FiPlus className="h-3.5 w-3.5 text-green-500" />
+                <span className="text-xs font-semibold text-green-600 uppercase">New Clause Added</span>
+              </div>
+              <span className="text-sm bg-green-100 text-green-800 underline decoration-green-500 decoration-2 underline-offset-2 leading-relaxed">{proposed}</span>
+            </div>
+          ) : (
+            <RedlineMarkup segments={segments} />
+          )}
+          {/* Redline legend */}
+          <div className="mt-3 pt-2 border-t border-slate-100 flex items-center gap-4 text-[10px] text-slate-400">
+            <span className="flex items-center gap-1">
+              <span className="bg-red-100 text-red-800 line-through decoration-red-500 px-1 rounded-sm">deleted text</span>
+              = removed from original
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="bg-green-100 text-green-800 underline decoration-green-500 underline-offset-2 px-1 rounded-sm">new text</span>
+              = added by counterparty
+            </span>
+          </div>
         </div>
-        <p className="text-sm text-green-900 leading-relaxed">{proposed || '(deleted)'}</p>
+      ) : (
+        /* ── Side-by-Side View ── */
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="rounded-md border border-red-200 bg-red-50/50 p-3">
+            <div className="flex items-center gap-1.5 mb-2">
+              <FiXCircle className="h-3.5 w-3.5 text-red-500" />
+              <span className="text-xs font-semibold text-red-700 uppercase tracking-wide">Original (FSL)</span>
+            </div>
+            <p className="text-sm text-red-900 leading-relaxed">{original || '(empty -- new clause)'}</p>
+          </div>
+          <div className="rounded-md border border-green-200 bg-green-50/50 p-3">
+            <div className="flex items-center gap-1.5 mb-2">
+              <FiCheckCircle className="h-3.5 w-3.5 text-green-500" />
+              <span className="text-xs font-semibold text-green-700 uppercase tracking-wide">Proposed (Counterparty)</span>
+            </div>
+            <p className="text-sm text-green-900 leading-relaxed">{proposed || '(deleted)'}</p>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function RedlineDocumentPreview({ clauses, overrides }: { clauses: ClauseAnalysis[]; overrides: Record<string, OverrideEntry> }) {
+  if (!Array.isArray(clauses) || clauses.length === 0) return null
+
+  return (
+    <Card className="border-slate-200 shadow-sm">
+      <CardHeader className="pb-2">
+        <div className="flex items-center justify-between">
+          <CardTitle className="text-base flex items-center gap-2">
+            <FiFileText className="h-4 w-4 text-slate-600" />
+            Full Redline Document Preview
+          </CardTitle>
+          <Badge variant="outline" className="text-xs">{clauses.length} clauses</Badge>
+        </div>
+        <CardDescription className="text-xs">Unified view of all changes with tracked-changes markup. Red strikethrough = deletions. Green underline = additions/modifications.</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <ScrollArea className="max-h-[500px]">
+          <div className="space-y-4 pr-4">
+            {clauses.map((clause) => {
+              const ov = overrides[clause.change_id]
+              const effectiveRec = ov?.recommendation || clause.recommendation || ''
+              const segments = computeWordDiff(clause.original_text || '', clause.proposed_text || '')
+              const ct = clause.change_type?.toLowerCase()
+
+              return (
+                <div key={clause.change_id} className="border-l-4 pl-3 py-2" style={{
+                  borderLeftColor: effectiveRec === 'Accept' ? '#22c55e' : effectiveRec === 'Reject' ? '#dc2626' : effectiveRec === 'Counter-Propose' ? '#f59e0b' : '#8b5cf6'
+                }}>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="text-xs font-bold text-slate-700">{clause.clause_reference}</span>
+                    <Badge className={cn('text-[10px] h-4', getRiskColor(clause.risk_level))}>{clause.risk_level}</Badge>
+                    <Badge variant="outline" className={cn('text-[10px] h-4 border', getRecommendationColor(effectiveRec))}>{effectiveRec}</Badge>
+                    {ov?.recommendation && <Badge className="bg-amber-500 text-white text-[10px] h-4">Overridden</Badge>}
+                  </div>
+                  <div className="text-sm leading-relaxed">
+                    {ct === 'deletion' && !clause.proposed_text ? (
+                      <span className="bg-red-100 text-red-800 line-through decoration-red-500 decoration-2">{clause.original_text}</span>
+                    ) : ct === 'addition' && !clause.original_text ? (
+                      <span className="bg-green-100 text-green-800 underline decoration-green-500 decoration-2 underline-offset-2">{clause.proposed_text}</span>
+                    ) : (
+                      <RedlineMarkup segments={segments} />
+                    )}
+                  </div>
+                  {ov?.counterProposal && (
+                    <div className="mt-1.5 text-xs bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                      <span className="font-semibold text-amber-700">Counter-Proposal: </span>
+                      <span className="text-amber-900">{ov.counterProposal}</span>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </ScrollArea>
+      </CardContent>
+    </Card>
+  )
+}
+
+function RedlineInstructionCard({ instruction }: { instruction: RedlineInstruction }) {
+  const segments = useMemo(
+    () => computeWordDiff(instruction.original_text || '', instruction.final_text || ''),
+    [instruction.original_text, instruction.final_text]
+  )
+  const action = instruction.action || ''
+
+  return (
+    <div className={cn('rounded-lg border p-3', action === 'Reject' ? 'border-red-200 bg-red-50/30' : action === 'Accept' ? 'border-green-200 bg-green-50/30' : action === 'Counter-Propose' ? 'border-amber-200 bg-amber-50/30' : 'border-slate-200')}>
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-xs text-slate-400">{instruction.change_id}</span>
+          <span className="text-sm font-semibold text-slate-700">{instruction.clause_reference}</span>
+        </div>
+        <Badge variant="outline" className={cn('text-xs border', getRecommendationColor(action))}>{action}</Badge>
+      </div>
+      {/* Inline redline */}
+      <div className="text-sm leading-relaxed mb-2">
+        <RedlineMarkup segments={segments} />
+      </div>
+      {/* Instruction */}
+      <div className="text-xs text-slate-600 bg-white/60 rounded px-2 py-1.5 border border-slate-100">
+        <span className="font-semibold text-slate-500">Instruction: </span>{instruction.instruction}
       </div>
     </div>
   )
@@ -1554,8 +1879,8 @@ export default function Page() {
                                 <p className="text-sm text-slate-700">{clause.change_summary ?? ''}</p>
                               </div>
 
-                              {/* Diff View */}
-                              <DiffView original={clause.original_text ?? ''} proposed={clause.proposed_text ?? ''} />
+                              {/* Redline / Diff View */}
+                              <DiffView original={clause.original_text ?? ''} proposed={clause.proposed_text ?? ''} changeType={clause.change_type} />
 
                               {/* Risk & Reasoning */}
                               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -1708,6 +2033,12 @@ export default function Page() {
                   </Card>
                 </div>
 
+                {/* Full Redline Document Preview */}
+                <RedlineDocumentPreview
+                  clauses={Array.isArray(currentAnalysis.clause_analyses) ? currentAnalysis.clause_analyses : []}
+                  overrides={overrides}
+                />
+
                 {/* Generate Outputs */}
                 <Card className="border-slate-200 shadow-sm">
                   <CardContent className="py-4">
@@ -1789,48 +2120,37 @@ export default function Page() {
                   </CardContent>
                 </Card>
 
-                {/* Redline Instructions */}
+                {/* Redline Instructions - with inline tracked changes */}
                 <Card className="border-slate-200 shadow-sm">
                   <CardHeader className="pb-2">
-                    <CardTitle className="text-base flex items-center gap-2">
-                      <FiEdit className="h-4 w-4 text-slate-600" />
-                      Redline Instructions
-                    </CardTitle>
+                    <div className="flex items-center justify-between">
+                      <CardTitle className="text-base flex items-center gap-2">
+                        <FiEdit className="h-4 w-4 text-slate-600" />
+                        Redline Document
+                      </CardTitle>
+                      <div className="flex items-center gap-3 text-[10px] text-slate-400">
+                        <span className="flex items-center gap-1">
+                          <span className="bg-red-100 text-red-800 line-through decoration-red-500 px-1 rounded-sm">deleted</span>
+                          = removed
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <span className="bg-green-100 text-green-800 underline decoration-green-500 underline-offset-2 px-1 rounded-sm">added</span>
+                          = new/modified
+                        </span>
+                      </div>
+                    </div>
+                    <CardDescription className="text-xs">Each clause shows the tracked changes between original and final text with the action instruction.</CardDescription>
                   </CardHeader>
                   <CardContent>
-                    <div className="overflow-x-auto">
-                      <Table>
-                        <TableHeader>
-                          <TableRow>
-                            <TableHead className="text-xs">Change ID</TableHead>
-                            <TableHead className="text-xs">Clause</TableHead>
-                            <TableHead className="text-xs">Action</TableHead>
-                            <TableHead className="text-xs">Original</TableHead>
-                            <TableHead className="text-xs">Final</TableHead>
-                            <TableHead className="text-xs">Instruction</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {(Array.isArray(currentOutput.redline_instructions) ? currentOutput.redline_instructions : []).map((ri, idx) => (
-                            <TableRow key={ri.change_id ?? idx}>
-                              <TableCell className="text-xs font-mono">{ri.change_id ?? ''}</TableCell>
-                              <TableCell className="text-xs font-medium">{ri.clause_reference ?? ''}</TableCell>
-                              <TableCell>
-                                <Badge variant="outline" className={cn('text-xs border', getRecommendationColor(ri.action ?? ''))}>{ri.action ?? ''}</Badge>
-                              </TableCell>
-                              <TableCell className="text-xs max-w-[150px] truncate" title={ri.original_text ?? ''}>{ri.original_text ?? ''}</TableCell>
-                              <TableCell className="text-xs max-w-[150px] truncate" title={ri.final_text ?? ''}>{ri.final_text ?? ''}</TableCell>
-                              <TableCell className="text-xs">{ri.instruction ?? ''}</TableCell>
-                            </TableRow>
-                          ))}
-                          {(!Array.isArray(currentOutput.redline_instructions) || currentOutput.redline_instructions.length === 0) && (
-                            <TableRow>
-                              <TableCell colSpan={6} className="text-center text-sm text-slate-400 py-6">No redline instructions available.</TableCell>
-                            </TableRow>
-                          )}
-                        </TableBody>
-                      </Table>
-                    </div>
+                    {(Array.isArray(currentOutput.redline_instructions) && currentOutput.redline_instructions.length > 0) ? (
+                      <div className="space-y-3">
+                        {currentOutput.redline_instructions.map((ri, idx) => (
+                          <RedlineInstructionCard key={ri.change_id ?? idx} instruction={ri} />
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-center text-sm text-slate-400 py-6">No redline instructions available.</div>
+                    )}
                   </CardContent>
                 </Card>
 
