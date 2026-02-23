@@ -534,7 +534,14 @@ export default function Page() {
   const [sampleMode, setSampleMode] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
 
-  // Upload state
+  // Upload state - FSL Original (Step 1)
+  const [originalInputMode, setOriginalInputMode] = useState<'document' | 'text'>('document')
+  const [originalFile, setOriginalFile] = useState<File | null>(null)
+  const [originalText, setOriginalText] = useState('')
+  const [originalDragOver, setOriginalDragOver] = useState(false)
+  const originalFileRef = useRef<HTMLInputElement>(null)
+
+  // Upload state - Counterparty Redline (Step 2)
   const [inputMode, setInputMode] = useState<'document' | 'email'>('document')
   const [emailText, setEmailText] = useState('')
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
@@ -591,14 +598,33 @@ export default function Page() {
     setTimeout(() => setCopiedField(null), 2000)
   }, [])
 
-  const handleFileSelect = useCallback((file: File) => {
+  const validateFileExt = useCallback((file: File): boolean => {
     const ext = file.name.split('.').pop()?.toLowerCase()
-    if (ext === 'docx' || ext === 'doc' || ext === 'pdf' || ext === 'txt') {
+    return ext === 'docx' || ext === 'doc' || ext === 'pdf' || ext === 'txt'
+  }, [])
+
+  const handleOriginalFileSelect = useCallback((file: File) => {
+    if (validateFileExt(file)) {
+      setOriginalFile(file)
+    } else {
+      setAnalysisError('Please upload a .docx, .pdf, or .txt file for the original NDA.')
+    }
+  }, [validateFileExt])
+
+  const handleOriginalDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    setOriginalDragOver(false)
+    const file = e.dataTransfer?.files?.[0]
+    if (file) handleOriginalFileSelect(file)
+  }, [handleOriginalFileSelect])
+
+  const handleFileSelect = useCallback((file: File) => {
+    if (validateFileExt(file)) {
       setSelectedFile(file)
     } else {
       setAnalysisError('Please upload a .docx, .pdf, or .txt file.')
     }
-  }, [])
+  }, [validateFileExt])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault()
@@ -615,36 +641,80 @@ export default function Page() {
     setOverrides({})
 
     try {
-      let message = ''
-      let assetIds: string[] | undefined
-
-      if (inputMode === 'document') {
-        if (!selectedFile) {
-          setAnalysisError('Please select a document to analyze.')
-          setAnalyzing(false)
-          setActiveAgentId(null)
-          return
-        }
-        const uploadResult = await uploadFiles(selectedFile)
-        if (!uploadResult.success || !Array.isArray(uploadResult.asset_ids) || uploadResult.asset_ids.length === 0) {
-          setAnalysisError(`File upload failed: ${uploadResult.error ?? uploadResult.message ?? 'Unknown error'}`)
-          setAnalyzing(false)
-          setActiveAgentId(null)
-          return
-        }
-        assetIds = uploadResult.asset_ids
-        message = `Please analyze the NDA document I've uploaded for all tracked changes and proposed modifications. Extract each change, assess policy compliance, and generate negotiation responses for each clause modification.`
-      } else {
-        if (!emailText.trim()) {
-          setAnalysisError('Please paste the email text to analyze.')
-          setAnalyzing(false)
-          setActiveAgentId(null)
-          return
-        }
-        message = `Please analyze the following NDA change request email for all proposed modifications. Extract each change, assess policy compliance, and generate negotiation responses:\n\n${emailText}`
+      // ── Step A: Validate that we have the FSL original ──
+      const hasOriginalDoc = originalInputMode === 'document' && originalFile
+      const hasOriginalText = originalInputMode === 'text' && originalText.trim()
+      if (!hasOriginalDoc && !hasOriginalText) {
+        setAnalysisError('Please provide the FSL original NDA (upload a document or paste the text).')
+        setAnalyzing(false)
+        setActiveAgentId(null)
+        return
       }
 
-      const result = await callAIAgent(message, MANAGER_AGENT_ID, assetIds ? { assets: assetIds } : undefined)
+      // ── Step B: Validate counterparty redline input ──
+      const hasRedlineDoc = inputMode === 'document' && selectedFile
+      const hasRedlineEmail = inputMode === 'email' && emailText.trim()
+      if (!hasRedlineDoc && !hasRedlineEmail) {
+        setAnalysisError(inputMode === 'document'
+          ? 'Please upload the counterparty\'s redlined document.'
+          : 'Please paste the counterparty\'s email text with proposed changes.')
+        setAnalyzing(false)
+        setActiveAgentId(null)
+        return
+      }
+
+      // ── Step C: Upload documents and collect asset IDs ──
+      const allAssetIds: string[] = []
+
+      // Upload FSL original if it's a file
+      if (hasOriginalDoc && originalFile) {
+        const origUpload = await uploadFiles(originalFile)
+        if (!origUpload.success || !Array.isArray(origUpload.asset_ids) || origUpload.asset_ids.length === 0) {
+          setAnalysisError(`FSL original upload failed: ${origUpload.error ?? origUpload.message ?? 'Unknown error'}`)
+          setAnalyzing(false)
+          setActiveAgentId(null)
+          return
+        }
+        allAssetIds.push(...origUpload.asset_ids)
+      }
+
+      // Upload counterparty redline if it's a file
+      if (hasRedlineDoc && selectedFile) {
+        const redlineUpload = await uploadFiles(selectedFile)
+        if (!redlineUpload.success || !Array.isArray(redlineUpload.asset_ids) || redlineUpload.asset_ids.length === 0) {
+          setAnalysisError(`Counterparty redline upload failed: ${redlineUpload.error ?? redlineUpload.message ?? 'Unknown error'}`)
+          setAnalyzing(false)
+          setActiveAgentId(null)
+          return
+        }
+        allAssetIds.push(...redlineUpload.asset_ids)
+      }
+
+      // ── Step D: Build comparative analysis message ──
+      let message = ''
+
+      // Case 1: Both documents uploaded as files
+      if (hasOriginalDoc && hasRedlineDoc) {
+        message = `I have uploaded two NDA documents for comparative analysis.\n\nThe FIRST document is FSL's original NDA template. The SECOND document is the counterparty's redlined version with proposed changes.\n\nPlease compare these two documents clause-by-clause. For each change the counterparty has made (additions, deletions, modifications), extract the original FSL text and the proposed counterparty text, assess policy compliance, assign risk levels, and generate negotiation responses.`
+      }
+      // Case 2: Original as text, redline as file
+      else if (hasOriginalText && hasRedlineDoc) {
+        message = `I am providing FSL's original NDA text below, and I have uploaded the counterparty's redlined version as a document.\n\n--- FSL ORIGINAL NDA TEXT ---\n${originalText}\n--- END FSL ORIGINAL ---\n\nPlease compare the uploaded counterparty redlined document against the FSL original text above. For each change the counterparty has made, extract the original FSL text and the proposed counterparty text, assess policy compliance, assign risk levels, and generate negotiation responses.`
+      }
+      // Case 3: Original as file, counterparty changes as email
+      else if (hasOriginalDoc && hasRedlineEmail) {
+        message = `I have uploaded FSL's original NDA document. Below is the counterparty's email describing their proposed changes to the NDA.\n\n--- COUNTERPARTY EMAIL ---\n${emailText}\n--- END COUNTERPARTY EMAIL ---\n\nPlease compare each proposed change from the email against the relevant clauses in the uploaded FSL original NDA. For each change, extract the original FSL text and the proposed modification, assess policy compliance, assign risk levels, and generate negotiation responses.`
+      }
+      // Case 4: Both as text
+      else if (hasOriginalText && hasRedlineEmail) {
+        message = `I am providing both FSL's original NDA text and the counterparty's proposed changes as text.\n\n--- FSL ORIGINAL NDA TEXT ---\n${originalText}\n--- END FSL ORIGINAL ---\n\n--- COUNTERPARTY PROPOSED CHANGES ---\n${emailText}\n--- END COUNTERPARTY CHANGES ---\n\nPlease compare the counterparty's proposed changes against FSL's original NDA text clause-by-clause. For each change, extract the original FSL text and the proposed counterparty text, assess policy compliance, assign risk levels, and generate negotiation responses.`
+      }
+
+      const result = await callAIAgent(
+        message,
+        MANAGER_AGENT_ID,
+        allAssetIds.length > 0 ? { assets: allAssetIds } : undefined
+      )
 
       if (result.success && result.response?.status === 'success') {
         const parsed = parseLLMJson(result.response.result)
@@ -664,7 +734,7 @@ export default function Page() {
       setAnalyzing(false)
       setActiveAgentId(null)
     }
-  }, [inputMode, selectedFile, emailText])
+  }, [inputMode, selectedFile, emailText, originalInputMode, originalFile, originalText])
 
   const handleGenerateOutputs = useCallback(async () => {
     if (!currentAnalysis) return
@@ -728,6 +798,9 @@ export default function Page() {
     setAnalysisData(null)
     setOutputData(null)
     setOverrides({})
+    setOriginalFile(null)
+    setOriginalText('')
+    setOriginalInputMode('document')
     setSelectedFile(null)
     setEmailText('')
     setAnalysisError('')
@@ -823,7 +896,7 @@ export default function Page() {
             <div className="max-w-7xl mx-auto px-4 sm:px-6 pb-2">
               <div className="flex items-center gap-1 text-xs">
                 {[
-                  { key: 'upload', label: 'Upload & Input' },
+                  { key: 'upload', label: 'Compare Documents' },
                   { key: 'review', label: 'Review & Override' },
                   { key: 'output', label: 'Generate Outputs' },
                 ].map((step, idx) => (
@@ -843,87 +916,208 @@ export default function Page() {
             {/* ─── SCREEN 1: UPLOAD ──────────────────────────────────── */}
             {screen === 'upload' && (
               <div className="space-y-6">
-                <div className="text-center max-w-2xl mx-auto">
-                  <h2 className="text-2xl font-bold text-slate-800 mb-2">Analyze NDA Changes</h2>
-                  <p className="text-sm text-slate-500">Upload a redlined NDA document or paste email text with proposed changes. The system will extract all modifications, evaluate compliance with FSL policy, and generate negotiation responses.</p>
+                <div className="text-center max-w-3xl mx-auto">
+                  <h2 className="text-2xl font-bold text-slate-800 mb-2">Compare & Analyze NDA Changes</h2>
+                  <p className="text-sm text-slate-500">Provide FSL's original NDA and the counterparty's redlined version or email with proposed changes. The system will compare them clause-by-clause, evaluate compliance with FSL policy, and generate negotiation responses.</p>
                 </div>
 
-                <Card className="max-w-2xl mx-auto border-slate-200 shadow-sm">
-                  <CardContent className="pt-6">
-                    <Tabs value={inputMode} onValueChange={(v) => setInputMode(v as 'document' | 'email')}>
-                      <TabsList className="grid w-full grid-cols-2 mb-4">
-                        <TabsTrigger value="document" className="flex items-center gap-2 text-sm">
-                          <FiUpload className="h-4 w-4" />
-                          Document Upload
-                        </TabsTrigger>
-                        <TabsTrigger value="email" className="flex items-center gap-2 text-sm">
-                          <FiMail className="h-4 w-4" />
-                          Email Text
-                        </TabsTrigger>
-                      </TabsList>
-
-                      <TabsContent value="document">
-                        <div
-                          className={cn('border-2 border-dashed rounded-lg p-8 text-center transition-colors cursor-pointer', dragOver ? 'border-blue-400 bg-blue-50' : selectedFile ? 'border-green-400 bg-green-50' : 'border-slate-300 hover:border-slate-400')}
-                          onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-                          onDragLeave={() => setDragOver(false)}
-                          onDrop={handleDrop}
-                          onClick={() => fileRef.current?.click()}
-                        >
-                          <input ref={fileRef} type="file" className="hidden" accept=".docx,.doc,.pdf,.txt" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileSelect(f) }} />
-                          {selectedFile ? (
-                            <div className="space-y-2">
-                              <FiCheckCircle className="h-10 w-10 text-green-500 mx-auto" />
-                              <p className="text-sm font-medium text-green-700">{selectedFile.name}</p>
-                              <p className="text-xs text-slate-500">{(selectedFile.size / 1024).toFixed(1)} KB</p>
-                              <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); setSelectedFile(null); if (fileRef.current) fileRef.current.value = '' }} className="text-xs text-slate-500">
-                                <FiX className="h-3 w-3 mr-1" /> Remove
-                              </Button>
-                            </div>
-                          ) : (
-                            <div className="space-y-2">
-                              <FiUpload className="h-10 w-10 text-slate-400 mx-auto" />
-                              <p className="text-sm text-slate-600">Drag and drop your NDA document here</p>
-                              <p className="text-xs text-slate-400">Supports .docx, .pdf, .txt</p>
-                            </div>
-                          )}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 max-w-5xl mx-auto">
+                  {/* ── LEFT PANEL: FSL Original NDA ── */}
+                  <Card className="border-slate-200 shadow-sm">
+                    <CardHeader className="pb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center justify-center h-7 w-7 rounded-full bg-blue-600 text-white text-xs font-bold">1</div>
+                        <div>
+                          <CardTitle className="text-base">FSL Original NDA</CardTitle>
+                          <CardDescription className="text-xs">Your standard NDA template as the baseline</CardDescription>
                         </div>
-                      </TabsContent>
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <Tabs value={originalInputMode} onValueChange={(v) => setOriginalInputMode(v as 'document' | 'text')}>
+                        <TabsList className="grid w-full grid-cols-2 mb-4">
+                          <TabsTrigger value="document" className="flex items-center gap-2 text-xs">
+                            <FiUpload className="h-3.5 w-3.5" />
+                            Upload Document
+                          </TabsTrigger>
+                          <TabsTrigger value="text" className="flex items-center gap-2 text-xs">
+                            <FiFileText className="h-3.5 w-3.5" />
+                            Paste Text
+                          </TabsTrigger>
+                        </TabsList>
 
-                      <TabsContent value="email">
-                        <div className="space-y-2">
-                          <Label className="text-sm">Paste the email text containing NDA change requests:</Label>
-                          <Textarea
-                            placeholder="Dear FSL Legal Team,&#10;&#10;Please find our proposed revisions to the Mutual NDA below:&#10;&#10;1. Section 2.1 - We propose to narrow the definition of Confidential Information to..."
-                            value={emailText}
-                            onChange={(e) => setEmailText(e.target.value)}
-                            rows={10}
-                            className="text-sm font-mono"
-                          />
-                          <p className="text-xs text-slate-400">{emailText.length} characters</p>
+                        <TabsContent value="document">
+                          <div
+                            className={cn('border-2 border-dashed rounded-lg p-6 text-center transition-colors cursor-pointer', originalDragOver ? 'border-blue-400 bg-blue-50' : originalFile ? 'border-green-400 bg-green-50' : 'border-slate-300 hover:border-slate-400')}
+                            onDragOver={(e) => { e.preventDefault(); setOriginalDragOver(true) }}
+                            onDragLeave={() => setOriginalDragOver(false)}
+                            onDrop={handleOriginalDrop}
+                            onClick={() => originalFileRef.current?.click()}
+                          >
+                            <input ref={originalFileRef} type="file" className="hidden" accept=".docx,.doc,.pdf,.txt" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleOriginalFileSelect(f) }} />
+                            {originalFile ? (
+                              <div className="space-y-2">
+                                <FiCheckCircle className="h-8 w-8 text-green-500 mx-auto" />
+                                <p className="text-sm font-medium text-green-700">{originalFile.name}</p>
+                                <p className="text-xs text-slate-500">{(originalFile.size / 1024).toFixed(1)} KB</p>
+                                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); setOriginalFile(null); if (originalFileRef.current) originalFileRef.current.value = '' }} className="text-xs text-slate-500">
+                                  <FiX className="h-3 w-3 mr-1" /> Remove
+                                </Button>
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                <FiUpload className="h-8 w-8 text-slate-400 mx-auto" />
+                                <p className="text-sm text-slate-600">Drop FSL original NDA here</p>
+                                <p className="text-xs text-slate-400">.docx, .pdf, .txt</p>
+                              </div>
+                            )}
+                          </div>
+                        </TabsContent>
+
+                        <TabsContent value="text">
+                          <div className="space-y-2">
+                            <Textarea
+                              placeholder="Paste FSL's original NDA template text here...&#10;&#10;MUTUAL NON-DISCLOSURE AGREEMENT&#10;&#10;Section 1. Definitions&#10;1.1 'Confidential Information' means..."
+                              value={originalText}
+                              onChange={(e) => setOriginalText(e.target.value)}
+                              rows={8}
+                              className="text-xs font-mono"
+                            />
+                            <p className="text-xs text-slate-400">{originalText.length} characters</p>
+                          </div>
+                        </TabsContent>
+                      </Tabs>
+
+                      {/* Status indicator */}
+                      <div className={cn('mt-3 flex items-center gap-2 text-xs rounded-md px-3 py-2', (originalFile || originalText.trim()) ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-slate-50 text-slate-400 border border-slate-200')}>
+                        {(originalFile || originalText.trim()) ? (
+                          <><FiCheckCircle className="h-3.5 w-3.5 shrink-0" /> Original NDA provided</>
+                        ) : (
+                          <><FiAlertCircle className="h-3.5 w-3.5 shrink-0" /> Awaiting original NDA</>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* ── RIGHT PANEL: Counterparty Redline ── */}
+                  <Card className="border-slate-200 shadow-sm">
+                    <CardHeader className="pb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center justify-center h-7 w-7 rounded-full bg-orange-500 text-white text-xs font-bold">2</div>
+                        <div>
+                          <CardTitle className="text-base">Counterparty Redline</CardTitle>
+                          <CardDescription className="text-xs">The redlined document or email with proposed changes</CardDescription>
                         </div>
-                      </TabsContent>
-                    </Tabs>
+                      </div>
+                    </CardHeader>
+                    <CardContent>
+                      <Tabs value={inputMode} onValueChange={(v) => setInputMode(v as 'document' | 'email')}>
+                        <TabsList className="grid w-full grid-cols-2 mb-4">
+                          <TabsTrigger value="document" className="flex items-center gap-2 text-xs">
+                            <FiUpload className="h-3.5 w-3.5" />
+                            Upload Redline
+                          </TabsTrigger>
+                          <TabsTrigger value="email" className="flex items-center gap-2 text-xs">
+                            <FiMail className="h-3.5 w-3.5" />
+                            Paste Email
+                          </TabsTrigger>
+                        </TabsList>
 
+                        <TabsContent value="document">
+                          <div
+                            className={cn('border-2 border-dashed rounded-lg p-6 text-center transition-colors cursor-pointer', dragOver ? 'border-orange-400 bg-orange-50' : selectedFile ? 'border-green-400 bg-green-50' : 'border-slate-300 hover:border-slate-400')}
+                            onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+                            onDragLeave={() => setDragOver(false)}
+                            onDrop={handleDrop}
+                            onClick={() => fileRef.current?.click()}
+                          >
+                            <input ref={fileRef} type="file" className="hidden" accept=".docx,.doc,.pdf,.txt" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileSelect(f) }} />
+                            {selectedFile ? (
+                              <div className="space-y-2">
+                                <FiCheckCircle className="h-8 w-8 text-green-500 mx-auto" />
+                                <p className="text-sm font-medium text-green-700">{selectedFile.name}</p>
+                                <p className="text-xs text-slate-500">{(selectedFile.size / 1024).toFixed(1)} KB</p>
+                                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); setSelectedFile(null); if (fileRef.current) fileRef.current.value = '' }} className="text-xs text-slate-500">
+                                  <FiX className="h-3 w-3 mr-1" /> Remove
+                                </Button>
+                              </div>
+                            ) : (
+                              <div className="space-y-2">
+                                <FiUpload className="h-8 w-8 text-slate-400 mx-auto" />
+                                <p className="text-sm text-slate-600">Drop counterparty redline here</p>
+                                <p className="text-xs text-slate-400">.docx, .pdf, .txt</p>
+                              </div>
+                            )}
+                          </div>
+                        </TabsContent>
+
+                        <TabsContent value="email">
+                          <div className="space-y-2">
+                            <Textarea
+                              placeholder="Paste the counterparty's email with proposed changes...&#10;&#10;Dear FSL Legal Team,&#10;&#10;Please find our proposed revisions to the Mutual NDA:&#10;&#10;1. Section 2.1 - We propose to narrow the definition..."
+                              value={emailText}
+                              onChange={(e) => setEmailText(e.target.value)}
+                              rows={8}
+                              className="text-xs font-mono"
+                            />
+                            <p className="text-xs text-slate-400">{emailText.length} characters</p>
+                          </div>
+                        </TabsContent>
+                      </Tabs>
+
+                      {/* Status indicator */}
+                      <div className={cn('mt-3 flex items-center gap-2 text-xs rounded-md px-3 py-2', (selectedFile || emailText.trim()) ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-slate-50 text-slate-400 border border-slate-200')}>
+                        {(selectedFile || emailText.trim()) ? (
+                          <><FiCheckCircle className="h-3.5 w-3.5 shrink-0" /> Counterparty input provided</>
+                        ) : (
+                          <><FiAlertCircle className="h-3.5 w-3.5 shrink-0" /> Awaiting counterparty redline</>
+                        )}
+                      </div>
+                    </CardContent>
+                  </Card>
+                </div>
+
+                {/* ── Analysis Trigger ── */}
+                <Card className="max-w-5xl mx-auto border-slate-200 shadow-sm">
+                  <CardContent className="py-4">
                     {analysisError && (
-                      <div className="mt-4 flex items-start gap-2 p-3 rounded-md bg-red-50 border border-red-200 text-red-700 text-sm">
+                      <div className="mb-4 flex items-start gap-2 p-3 rounded-md bg-red-50 border border-red-200 text-red-700 text-sm">
                         <FiAlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
                         <span>{analysisError}</span>
                       </div>
                     )}
 
-                    <Button onClick={handleAnalyze} disabled={analyzing} className="w-full mt-4 bg-slate-800 hover:bg-slate-700 text-white">
-                      {analyzing ? (
-                        <><FiLoader className="h-4 w-4 mr-2 animate-spin" /> Analyzing...</>
-                      ) : (
-                        <><FiSearch className="h-4 w-4 mr-2" /> Analyze NDA</>
-                      )}
-                    </Button>
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="flex items-center gap-3 text-sm">
+                        <div className={cn('flex items-center gap-1.5', (originalFile || originalText.trim()) ? 'text-green-600' : 'text-slate-400')}>
+                          {(originalFile || originalText.trim()) ? <FiCheckCircle className="h-4 w-4" /> : <FiAlertCircle className="h-4 w-4" />}
+                          <span className="hidden sm:inline">Original</span>
+                        </div>
+                        <FiPlus className="h-3 w-3 text-slate-400" />
+                        <div className={cn('flex items-center gap-1.5', (selectedFile || emailText.trim()) ? 'text-green-600' : 'text-slate-400')}>
+                          {(selectedFile || emailText.trim()) ? <FiCheckCircle className="h-4 w-4" /> : <FiAlertCircle className="h-4 w-4" />}
+                          <span className="hidden sm:inline">Redline</span>
+                        </div>
+                        <FiArrowRight className="h-3 w-3 text-slate-400" />
+                        <span className="text-slate-600 font-medium">Comparative Analysis</span>
+                      </div>
+                      <Button
+                        onClick={handleAnalyze}
+                        disabled={analyzing || (!(originalFile || originalText.trim()) || !(selectedFile || emailText.trim()))}
+                        className="bg-slate-800 hover:bg-slate-700 text-white shrink-0"
+                      >
+                        {analyzing ? (
+                          <><FiLoader className="h-4 w-4 mr-2 animate-spin" /> Analyzing...</>
+                        ) : (
+                          <><FiSearch className="h-4 w-4 mr-2" /> Analyze NDA</>
+                        )}
+                      </Button>
+                    </div>
 
                     {analyzing && (
                       <div className="mt-4 space-y-2">
                         <Progress value={progress} className="h-2" />
-                        <p className="text-xs text-slate-500 text-center">Processing through Change Extraction, Policy Compliance, and Response Generation agents...</p>
+                        <p className="text-xs text-slate-500 text-center">Comparing documents through Change Extraction, Policy Compliance, and Response Generation agents...</p>
                       </div>
                     )}
                   </CardContent>
@@ -932,7 +1126,9 @@ export default function Page() {
                 {analyzing && <LoadingSkeleton />}
 
                 {!analyzing && (
-                  <AgentStatusPanel activeAgentId={activeAgentId} />
+                  <div className="max-w-5xl mx-auto">
+                    <AgentStatusPanel activeAgentId={activeAgentId} />
+                  </div>
                 )}
               </div>
             )}
